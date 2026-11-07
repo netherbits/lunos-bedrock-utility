@@ -14,7 +14,7 @@ Setup creates **Lunos Toolbox - Start Server**, **Lunos Toolbox - World Backup**
 
 - **Start Server** opens Bedrock and a Live Stats Dashboard. The dashboard shows uptime, connected players, session and global playtime, and the latest backup at each configured destination. It stays open with a session summary after Bedrock stops. All-time totals and last-seen times are saved at shutdown to `LunosTools\GlobalServerStats\Playtime.txt`.
 - **World Backup** asks for confirmation and checks that Bedrock is stopped. It creates a timestamped ZIP of `worlds` in the primary folder. If a secondary folder is configured, it copies the ZIP there and checks that the files match.
-- **Server Update** opens Minecraft's download page and asks you to select the Windows server ZIP. After confirmation, it creates a versioned full backup in the primary folder, copies the update files, and adds new `server.properties` keys while keeping existing values. It preserves worlds, Toolbox files, allowlists, and player permissions.
+- **Server Update** opens Minecraft's download page and asks you to select the Windows server ZIP. After confirmation, it creates a versioned full backup in the primary folder, copies the update files, and adds new `server.properties` keys while keeping existing values. It preserves worlds and Toolbox files. For behavior, resource, and development pack folders it adds missing files only. It appends new allowlist and permissions entries while retaining existing entries.
 
 ## Move or reconfigure
 

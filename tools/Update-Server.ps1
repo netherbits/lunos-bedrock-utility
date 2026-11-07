@@ -1,9 +1,93 @@
 $ErrorActionPreference = 'Stop'
 $serverRoot = Split-Path -Parent $PSScriptRoot
 
+function Get-BedrockVersion([string]$Path) {
+    $versionInfo = (Get-Item -LiteralPath $Path).VersionInfo
+    foreach ($label in $versionInfo.ProductVersion, $versionInfo.FileVersion) {
+        if ($label -match '^\s*v?(?<version>\d+(?:\s*[.,]\s*\d+){1,3})(?=\s|[-+]|$)') {
+            $version = $Matches.version -replace '\s*[.,]\s*', '.'
+            if ($version -match '[1-9]') { return $version }
+        }
+    }
+    return 'unknown'
+}
+
+function Assert-WindowsExecutable([string]$Path) {
+    $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($Path))
+    try {
+        if ($reader.BaseStream.Length -ge 64 -and $reader.ReadUInt16() -eq 0x5A4D) {
+            $reader.BaseStream.Position = 60
+            $headerOffset = $reader.ReadUInt32()
+            if ($headerOffset -ge 64 -and $headerOffset -le ($reader.BaseStream.Length - 4)) {
+                $reader.BaseStream.Position = $headerOffset
+                if ($reader.ReadUInt32() -eq 0x00004550) { return }
+            }
+        }
+        throw 'The package bedrock_server.exe is not a Windows executable.'
+    } finally {
+        $reader.Dispose()
+    }
+}
+
 function Assert-ServerStopped {
     if (Get-Process -Name bedrock_server -ErrorAction SilentlyContinue) {
         throw 'Bedrock is running. Enter stop in its console, then run the updater again.'
+    }
+}
+
+function Read-PlayerList([string]$Path) {
+    $json = [IO.File]::ReadAllText($Path)
+    if (!$json.TrimStart().StartsWith('[')) {
+        throw "$(Split-Path -Leaf $Path) must contain a JSON array."
+    }
+    foreach ($entry in (ConvertFrom-Json -InputObject $json)) { $entry }
+}
+
+function Get-PlayerKeys($Entry, [string]$ListName) {
+    if ($Entry -isnot [pscustomobject]) { throw "$ListName contains a non-object entry." }
+    if ($Entry.xuid) { "xuid:$($Entry.xuid)" }
+    if ($ListName -eq 'allowlist.json' -and $Entry.name) { "name:$($Entry.name)" }
+}
+
+function Get-MergedPlayerList([string]$InstalledPath, [string]$PackagePath) {
+    if (!(Test-Path -LiteralPath $PackagePath -PathType Leaf)) { return }
+
+    $incoming = @(Read-PlayerList $PackagePath)
+    $exists = Test-Path -LiteralPath $InstalledPath -PathType Leaf
+    if ($exists -and $incoming.Count -eq 0) { return }
+
+    $name = Split-Path -Leaf $PackagePath
+    $existing = @()
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($exists) {
+        $existing = @(Read-PlayerList $InstalledPath)
+        foreach ($entry in $existing) {
+            foreach ($key in Get-PlayerKeys $entry $name) { [void]$known.Add($key) }
+        }
+    }
+    $added = @(foreach ($entry in $incoming) {
+        $keys = @(Get-PlayerKeys $entry $name)
+        if ($keys.Count -eq 0) { throw "An entry in the package's $name has no player identifier." }
+        if ($keys | Where-Object { $known.Contains($_) }) { continue }
+        foreach ($key in $keys) { [void]$known.Add($key) }
+        $entry
+    })
+    if (!$exists -or $added.Count -gt 0) {
+        ConvertTo-Json -InputObject ($existing + $added) -Depth 100
+    }
+}
+
+function Write-UpdatedConfig([string]$Path, [string]$Content) {
+    $temporary = "$Path.$([Guid]::NewGuid()).partial"
+    try {
+        [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, [NullString]::Value)
+        } else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue }
     }
 }
 
@@ -57,11 +141,14 @@ try {
         !(Test-Path -LiteralPath $packageProperties -PathType Leaf)) {
         throw 'Choose the Windows Bedrock Dedicated Server ZIP with bedrock_server.exe and server.properties at its root.'
     }
-    $currentVersion = (Get-Item -LiteralPath $currentExe).VersionInfo.ProductVersion
-    $newVersion = (Get-Item -LiteralPath $packageExe).VersionInfo.ProductVersion
-    if ($currentVersion -notmatch '^\d+(\.\d+)+$' -or $newVersion -notmatch '^\d+(\.\d+)+$') {
-        throw 'Could not read the Bedrock version from both server executables.'
+    Assert-WindowsExecutable $packageExe
+    $currentVersion = Get-BedrockVersion $currentExe
+    $newVersion = Get-BedrockVersion $packageExe
+    if ($newVersion -eq 'unknown' -and
+        (Split-Path -Leaf $package) -match '^bedrock-server-(?<version>\d+(?:\.\d+){1,3})(?:\s*\(\d+\))?\.zip$') {
+        $newVersion = $Matches.version
     }
+    $packageHash = (Get-FileHash -LiteralPath $packageExe -Algorithm SHA256).Hash
 
     $keyPattern = '^\s*([^#!\s=]+)\s*='
     $knownKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -73,9 +160,21 @@ try {
         if ($line -match $keyPattern -and $knownKeys.Add($Matches[1])) { $line }
     }
     $count = @($added).Count
+    $packFolders = @(
+        'behavior_packs'
+        'development_behavior_packs'
+        'development_resource_packs'
+        'development_skin_packs'
+        'resource_packs'
+    )
+    $mergedLists = @{}
+    foreach ($name in 'allowlist.json', 'permissions.json') {
+        $content = Get-MergedPlayerList (Join-Path $serverRoot $name) (Join-Path $stage $name)
+        if ($null -ne $content) { $mergedLists[$name] = $content }
+    }
     Write-Host "  Installed $currentVersion   Package $newVersion" -ForegroundColor White
     Write-Host "  New properties to add: $count" -ForegroundColor Gray
-    Write-Host '  The worlds folder and existing property values will be kept.' -ForegroundColor Gray
+    Write-Host '  Worlds, existing pack files, settings, and player entries will be kept.' -ForegroundColor Gray
     if ((Read-Host '  Back up and apply this package? [Y/N]') -notmatch '^(y|yes)$') {
         Write-Host '  Update canceled.' -ForegroundColor Yellow
         exit 0
@@ -98,25 +197,34 @@ try {
 
     Write-Host '  [3/4] Installing updated server files...' -ForegroundColor Cyan
     $copyStarted = $true
-    & robocopy.exe $stage $serverRoot /E /IS /IT /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD worlds LunosTools /XF server.properties allowlist.json whitelist.json permissions.json
+    $copyOptions = @('/E', '/R:0', '/W:0', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/XJ')
+    $excludedFolders = @('worlds', 'LunosTools') + $packFolders
+    & robocopy.exe $stage $serverRoot @copyOptions /IS /IT /XD @excludedFolders /XF server.properties allowlist.json whitelist.json permissions.json
     if ($LASTEXITCODE -ge 8) { throw "Server file copy failed (robocopy exit $LASTEXITCODE)." }
 
-    Write-Host '  [4/4] Merging server.properties...' -ForegroundColor Cyan
+    Write-Host '  [4/4] Adding missing pack files and merging settings and player lists...' -ForegroundColor Cyan
+    foreach ($name in $packFolders) {
+        $source = Join-Path $stage $name
+        if (!(Test-Path -LiteralPath $source -PathType Container)) { continue }
+        # Exclude existing files regardless of size or timestamp.
+        & robocopy.exe $source (Join-Path $serverRoot $name) @copyOptions /XC /XN /XO
+        if ($LASTEXITCODE -ge 8) { throw "Pack merge failed for $name (robocopy exit $LASTEXITCODE)." }
+    }
+    foreach ($name in $mergedLists.Keys) {
+        Write-UpdatedConfig (Join-Path $serverRoot $name) $mergedLists[$name]
+    }
     if ($count -gt 0) {
         $merged = $existing.TrimEnd([char[]]"`r`n") + "`r`n`r`n# Added by the Bedrock $newVersion update`r`n" +
             ($added -join "`r`n") + "`r`n"
-        $mergedPath = Join-Path $stage 'merged-server.properties'
-        [IO.File]::WriteAllText($mergedPath, $merged, [Text.UTF8Encoding]::new($false))
-        # Replace requires both files to reside on the same volume.
-        $pending = Join-Path $serverRoot ("server.properties.$([Guid]::NewGuid()).partial")
-        Copy-Item -LiteralPath $mergedPath -Destination $pending
-        [IO.File]::Replace($pending, $currentProperties, [NullString]::Value)
+        Write-UpdatedConfig $currentProperties $merged
     }
 
-    $installedVersion = (Get-Item -LiteralPath $currentExe).VersionInfo.ProductVersion
-    if ($installedVersion -ne $newVersion) { throw 'The installed executable version did not match the package.' }
+    if ((Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash -ne $packageHash) {
+        throw 'The installed executable did not match the package.'
+    }
+    $installedLabel = if ($newVersion -eq 'unknown') { 'Bedrock' } else { "Bedrock $newVersion" }
     Write-Host
-    Write-Host "  Update complete. Bedrock $installedVersion is ready to start." -ForegroundColor Green
+    Write-Host "  Update complete. $installedLabel is ready to start." -ForegroundColor Green
 } catch {
     Write-Host
     Write-Host "  Update failed. $($_.Exception.Message)" -ForegroundColor Red

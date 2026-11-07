@@ -1,0 +1,7 @@
+Toolbox.install.json
+Toolbox.settings.json
+GlobalServerStats/
+*.lnk
+*.log
+*.partial
+*.zip
